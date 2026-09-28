@@ -1,0 +1,50 @@
+# Totus Support — React Native 0.79 (bare workflow)
+node_modules/
+.env
+.env.*
+!.env.example
+*.pem
+*.p8
+*.p12
+*.mobileprovision
+*.keystore
+!debug.keystore
+*.jks
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.iml
+
+# logs
+*.log
+.metro-health-check*
+
+# iOS
+ios/Pods/
+ios/build/
+ios/DerivedData/
+ios/**/xcuserdata/
+ios/**/*.xcuserstate
+ios/.xcode.env.local
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/keystore.properties
+android/keystores/
+android/.cxx/
+android/app/release/
+*.apk
+*.aab
+
+# bundles / caches
+*.jsbundle
+*.hbc
+*.tsbuildinfo
+coverage/
+.eslintcache
