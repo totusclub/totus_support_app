@@ -1,0 +1,24 @@
+buildscript {
+    ext {
+        buildToolsVersion = "35.0.0"
+        // 26 (Android 8.0): адаптивная векторная иконка без PNG и надёжный ConnectionService для CallKeep
+        minSdkVersion = 26
+        compileSdkVersion = 35
+        targetSdkVersion = 35
+        ndkVersion = "27.1.12297006"
+        kotlinVersion = "2.0.21"
+    }
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        // Firebase Cloud Messaging (входящие звонки: data-push incoming_call от calling_api_v2)
+        classpath("com.google.gms:google-services:4.4.2")
+    }
+}
+
+apply plugin: "com.facebook.react.rootproject"
