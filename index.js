@@ -11,10 +11,15 @@ import {
   handleBackgroundCallKeepEvent,
   registerAndroidCallBackgroundHandlers,
 } from './src/voip/CallService';
+import {bootstrapVoipFromStoredSession} from './src/voip/coldStart';
 import {handleNotifeeBackgroundEvent} from './src/push/localNotifications';
 
 // Android: FCM data-push «incoming_call» от calling_api_v2 (фон и выгруженное приложение)
 registerAndroidCallBackgroundHandlers();
+
+// iOS: VoIP-пуш запустил JS в фоне (закрытое приложение / экран блокировки) —
+// поднять движок звонков сразу, чтобы «Ответить» в CallKit соединял без открытия приложения.
+bootstrapVoipFromStoredSession();
 
 // Тап по локальному уведомлению (сообщение / пропущенный звонок), когда приложение в фоне
 notifee.onBackgroundEvent(handleNotifeeBackgroundEvent);

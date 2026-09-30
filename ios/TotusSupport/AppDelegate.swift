@@ -17,6 +17,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
   var reactNativeFactory: RCTReactNativeFactory?
   private var launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   private var didStartReactNative = false
+  /// React root view created by a background start (VoIP push while the app was closed
+  /// or the phone was locked). JS already runs inside it; the scene attaches it later
+  /// instead of starting a second React Native instance.
+  private var backgroundRootView: UIView?
   /// Must stay alive for the process lifetime. The voip-push library keeps
   /// PKPushRegistry in a local variable, so iOS drops it and incoming pushes never arrive.
   private var voipRegistry: PKPushRegistry?
@@ -57,14 +61,41 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
   /// Called from SceneDelegate. Xcode 27 / iOS 27 SDK refuses to launch apps that
   /// create a UIWindow from the app delegate instead of a UIWindowScene.
   func startReactNative(in window: UIWindow) {
-    guard !didStartReactNative, let factory = reactNativeFactory else { return }
-    didStartReactNative = true
+    guard let factory = reactNativeFactory, let delegate = reactNativeDelegate else { return }
     self.window = window
+
+    // JS was already started in the background by a VoIP push: show the same root view.
+    if let rootView = backgroundRootView {
+      backgroundRootView = nil
+      let rootViewController = delegate.createRootViewController()
+      delegate.setRootView(rootView, toRootViewController: rootViewController)
+      window.rootViewController = rootViewController
+      window.makeKeyAndVisible()
+      return
+    }
+
+    guard !didStartReactNative else { return }
+    didStartReactNative = true
     factory.startReactNative(
       withModuleName: "TotusSupport",
       in: window,
       launchOptions: launchOptions
     )
+  }
+
+  /// VoIP push woke a closed app (or the phone is locked): iOS does not connect a
+  /// scene until the user opens the app, so without this JS would not run and
+  /// "Answer" in CallKit could not connect the call. Start React Native without a
+  /// window: the call engine (VoipService) comes up and answers from CallKit directly.
+  func startReactNativeInBackgroundIfNeeded() {
+    guard !didStartReactNative, let factory = reactNativeFactory else { return }
+    didStartReactNative = true
+    backgroundRootView = factory.rootViewFactory.view(
+      withModuleName: "TotusSupport",
+      initialProperties: nil,
+      launchOptions: launchOptions
+    )
+    print("📞 React Native started in background for incoming VoIP call")
   }
 
   // MARK: - Links
@@ -136,6 +167,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
     ) {
       completion()
     }
+
+    // App closed / phone locked: start JS now so the answer connects without opening the app.
+    startReactNativeInBackgroundIfNeeded()
   }
 
   func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
