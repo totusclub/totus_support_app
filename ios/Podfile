@@ -40,6 +40,30 @@ target 'TotusSupport' do
       :mac_catalyst_enabled => false,
     )
 
+    # Xcode 27 rejects IPHONEOS_DEPLOYMENT_TARGET below 15.0 (privacy bundles
+    # from Firebase / RNSVG / AsyncStorage still declare 9.0–12.4).
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |build_config|
+        deployment_target = build_config.build_settings['IPHONEOS_DEPLOYMENT_TARGET']
+        if deployment_target.nil? || deployment_target.to_f < 15.1
+          build_config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.1'
+        end
+      end
+    end
+
+    # fmt 11.0.2 enables consteval on Apple Clang >= 14. Xcode 16.3+ (including
+    # Xcode 27) rejects those format-string checks in format.cc.
+    fmt_base = File.join(installer.sandbox.pod_dir('fmt'), 'include', 'fmt', 'base.h')
+    if File.exist?(fmt_base)
+      contents = File.read(fmt_base)
+      needle = "#elif defined(__apple_build_version__) && __apple_build_version__ < 14000029L\n#  define FMT_USE_CONSTEVAL 0  // consteval is broken in Apple clang < 14."
+      replacement = "#elif defined(__apple_build_version__)\n#  define FMT_USE_CONSTEVAL 0  // consteval is broken in Apple clang (Xcode 16.3+)."
+      if contents.include?(needle)
+        File.chmod(0o644, fmt_base)
+        File.write(fmt_base, contents.sub(needle, replacement))
+      end
+    end
+
     # Статический umbrella Pods_*.framework линкуется как -lPods-* и ломает сборку —
     # отдельные поды уже подключены через OTHER_LDFLAGS (как в totus_APP).
     installer.aggregate_targets.each do |aggregate_target|

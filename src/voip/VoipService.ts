@@ -542,6 +542,8 @@ async function registerDeviceWithBackend(token: string, loyaltyId: string | null
     voipToken: cleanToken,
     platform: Platform.OS,
     loyaltyId: loyaltyId,
+    // Backend must push to <bundleId>.voip. The club app topic will not reach this app.
+    bundleId: 'club.totus.support',
   };
 
   // console.log('📤 Sending device registration to backend:');

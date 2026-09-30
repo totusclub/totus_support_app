@@ -15,6 +15,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
 
   var reactNativeDelegate: ReactNativeDelegate?
   var reactNativeFactory: RCTReactNativeFactory?
+  private var launchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  private var didStartReactNative = false
+  /// Must stay alive for the process lifetime. The voip-push library keeps
+  /// PKPushRegistry in a local variable, so iOS drops it and incoming pushes never arrive.
+  private var voipRegistry: PKPushRegistry?
 
   func application(
     _ application: UIApplication,
@@ -27,9 +32,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
       FirebaseApp.configure()
     }
 
-    // Регистрация PushKit при запуске — обязательна, чтобы VoIP-пуш дошёл до выгруженного
-    // приложения ещё до старта JS (react-native-voip-push-notification: delegate = AppDelegate).
-    RNVoipPushNotificationManager.voipRegistration()
+    // PushKit до старта JS, чтобы VoIP-пуш разбудил выгруженное приложение.
+    // Registry держим сильной ссылкой: локальный объект библиотеки освобождается сразу.
+    let registry = PKPushRegistry(queue: .main)
+    registry.delegate = self
+    registry.desiredPushTypes = [.voIP]
+    voipRegistry = registry
 
     let delegate = ReactNativeDelegate()
     let factory = RCTReactNativeFactory(delegate: delegate)
@@ -37,16 +45,26 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
 
     reactNativeDelegate = delegate
     reactNativeFactory = factory
+    self.launchOptions = launchOptions
 
-    window = UIWindow(frame: UIScreen.main.bounds)
+    // UIKit instantiates this class by name from Info.plist. Without a live
+    // reference the linker drops it, and iOS 27 then shows an empty window.
+    _ = SceneDelegate.self
 
+    return true
+  }
+
+  /// Called from SceneDelegate. Xcode 27 / iOS 27 SDK refuses to launch apps that
+  /// create a UIWindow from the app delegate instead of a UIWindowScene.
+  func startReactNative(in window: UIWindow) {
+    guard !didStartReactNative, let factory = reactNativeFactory else { return }
+    didStartReactNative = true
+    self.window = window
     factory.startReactNative(
       withModuleName: "TotusSupport",
       in: window,
       launchOptions: launchOptions
     )
-
-    return true
   }
 
   // MARK: - Links
@@ -122,6 +140,48 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
 
   func pushRegistry(_ registry: PKPushRegistry, didInvalidatePushTokenFor type: PKPushType) {
     print("📱 PKPushRegistry: VoIP token invalidated — iOS перерегистрирует автоматически")
+  }
+}
+
+/// Lives in this file so it is compiled with AppDelegate. A separate
+/// SceneDelegate.swift was left out of the Xcode build, and UIKit then
+/// logged "could not load class TotusSupport.SceneDelegate".
+class SceneDelegate: UIResponder, UIWindowSceneDelegate {
+  var window: UIWindow?
+
+  func scene(
+    _ scene: UIScene,
+    willConnectTo session: UISceneSession,
+    options connectionOptions: UIScene.ConnectionOptions
+  ) {
+    guard let windowScene = scene as? UIWindowScene,
+          let appDelegate = UIApplication.shared.delegate as? AppDelegate else {
+      return
+    }
+
+    let window = UIWindow(windowScene: windowScene)
+    window.frame = windowScene.coordinateSpace.bounds
+    window.backgroundColor = .systemBackground
+    self.window = window
+    window.makeKeyAndVisible()
+    appDelegate.startReactNative(in: window)
+
+    if let url = connectionOptions.urlContexts.first?.url {
+      _ = RCTLinkingManager.application(
+        UIApplication.shared,
+        open: url,
+        options: [:]
+      )
+    }
+  }
+
+  func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+    guard let url = URLContexts.first?.url else { return }
+    _ = RCTLinkingManager.application(
+      UIApplication.shared,
+      open: url,
+      options: [:]
+    )
   }
 }
 

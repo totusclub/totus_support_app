@@ -24,16 +24,35 @@
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Totus Support использует микрофон для голосовых звонков с пользователями.</string>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>Totus Support использует Bluetooth, чтобы подключать гарнитуру во время звонков.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<false/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
+	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Totus Support использует Bluetooth, чтобы подключать гарнитуру во время звонков.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Totus Support использует камеру для видеозвонков с пользователями.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Totus Support использует микрофон для голосовых звонков с пользователями.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<false/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneConfigurationName</key>
+					<string>Default Configuration</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).SceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
 	</dict>
 	<key>UIBackgroundModes</key>
 	<array>
