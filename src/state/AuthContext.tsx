@@ -12,6 +12,7 @@ import {
 import {ensureFreshAccessToken, loadTokens, setSessionExpiredHandler} from '../api/http';
 import {initCallKeep} from '../voip/CallService';
 import {cleanupVoipOnLogout} from '../voip/VoipService';
+import {cancelMicPermissionRequest, ensureMicPermissionWhenActive} from '../voip/micPermission';
 import {connectSupportSocket, disconnectSupportSocket} from '../realtime/supportSocket';
 import {setHistoryOwner} from '../history/callHistory';
 import {
@@ -56,6 +57,9 @@ async function startServices(user: AgentUser) {
   connectSupportSocket();
   ensureNotificationChannels().catch(() => {});
   requestNotificationPermission().catch(() => {});
+  // iOS: доступ к микрофону заранее, пока приложение на экране — иначе первый ответ
+  // на звонок из CallKit / с экрана блокировки сбрасывается (нельзя показать запрос)
+  ensureMicPermissionWhenActive();
 }
 
 export function AuthProvider({children}: {children: React.ReactNode}) {
@@ -70,6 +74,7 @@ export function AuthProvider({children}: {children: React.ReactNode}) {
   const logout = useCallback(async (reason?: string) => {
     if (loggingOut.current) return;
     loggingOut.current = true;
+    cancelMicPermissionRequest();
     try {
       await cleanupVoipOnLogout();
     } catch (e) {
