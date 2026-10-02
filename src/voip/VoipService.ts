@@ -22,6 +22,13 @@ import {VOIP_BASE_URL} from '../config/server';
 // agent-JWT (вход POST /api/web/login): Bearer в HTTP и токен в handshake Socket.io.
 import {voipFetch, voipSocketAuth, setVoipAccessToken} from '../api/voipAuth';
 import {
+  createAnswerGate,
+  decideOnResume,
+  offerRetryDelayMs,
+  OFFER_FETCH_MAX_ATTEMPTS,
+  summarizeInitialCallKeepEvents,
+} from './answerRecovery';
+import {
   startAndroidCallForegroundService,
   stopAndroidCallForegroundService,
 } from './AndroidCallForegroundService';
@@ -65,6 +72,7 @@ import {
   RTCIceCandidate,
   mediaDevices,
   MediaStream,
+  RTCAudioSession,
 } from 'react-native-webrtc';
 
 const BASE_URL = VOIP_BASE_URL;
@@ -257,6 +265,9 @@ let fcmTokenRefreshUnsubscribe: (() => void) | null = null;
 const recentlyHandledIncomingCalls = new Map<string, number>();
 const DUPLICATE_INCOMING_WINDOW_MS = 15000;
 const incomingOfferByCallId = new Map<string, {type: string; sdp: string}>();
+// One answer per call (see answerRecovery.ts): no second RTCPeerConnection for the same call.
+const answerGate = createAnswerGate();
+let voipResumeSubscription: {remove: () => void} | null = null;
 // Network monitoring
 let networkUnsubscribe: (() => void) | null = null;
 let isNetworkMonitoring = false;
@@ -1298,11 +1309,15 @@ function ensureSocketConnected() {
 
 async function fetchRemoteOfferWithRetry(
   callUUID: string,
-  maxAttempts = 8,
-  delayMs = 500,
+  maxAttempts = OFFER_FETCH_MAX_ATTEMPTS,
 ): Promise<{type: string; sdp: string}> {
   let lastStatus: number | null = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const pauseMs = offerRetryDelayMs(attempt);
+    if (pauseMs > 0) {
+      // After a long background the network / token refresh may need a few seconds.
+      await new Promise(resolve => setTimeout(resolve, pauseMs));
+    }
     try {
       const resp = await voipFetch(`${BASE_URL}/api/calls/${callUUID}`);
       lastStatus = resp.status;
@@ -1314,10 +1329,6 @@ async function fetchRemoteOfferWithRetry(
       }
     } catch (e) {
       // Network race during cold start; retry below.
-    }
-
-    if (attempt < maxAttempts) {
-      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 
@@ -1340,16 +1351,156 @@ export function queuePendingAnswerFromBackground(callUUID: string): void {
   // If VoIP is already initialized, process immediately.
   // This avoids waiting for init hooks when app is reopened from killed/background answer.
   if (isVoipInitialized) {
-    setTimeout(() => {
-      if (activeCallUUID === callUUID) {
-        processPendingAnswer(callUUID).catch(e => {
-          console.error(
-            '❌ Failed to process queued background answer immediately:',
-            e,
-          );
-        });
+    schedulePendingAnswer(callUUID, 200, 'background_queue');
+  }
+}
+
+/**
+ * The only entry point for a pending answer (answered while the app was in the
+ * background or closed). Idempotent: repeated calls for the same call are ignored
+ * while an answer is running or after it succeeded (answerGate).
+ */
+function schedulePendingAnswer(callUUID: string | null, delayMs: number, source: string): void {
+  if (!callUUID) {
+    return;
+  }
+  if (answerGate.isInFlight(callUUID) || answerGate.isDone(callUUID)) {
+    console.log('pendingAnswer: already handled, skip', {callUUID, source});
+    if (pendingAnswerCallUUID === callUUID) {
+      pendingAnswerCallUUID = null;
+    }
+    return;
+  }
+  // Show the active-call screen right away.
+  activeCallUUID = callUUID;
+  incomingCallUUID = null;
+  currentCallState = 'answered';
+  setTimeout(() => {
+    if (activeCallUUID !== callUUID && pendingAnswerCallUUID !== callUUID) {
+      return; // call ended meanwhile
+    }
+    processPendingAnswer(callUUID).catch(e => {
+      console.error(`❌ Failed to process pending answer (${source}):`, e);
+    });
+  }, delayMs);
+}
+
+/**
+ * Leftovers of an earlier call (lock, incoming UUID) without a live peer must not
+ * block answering a new call after a long background.
+ */
+function clearStaleCallStateFor(callUUID: string): void {
+  if (pc) {
+    return;
+  }
+  if (activeCallLockUUID && activeCallLockUUID !== callUUID) {
+    console.warn('answer: releasing stale call lock of', activeCallLockUUID);
+    releaseCallLock();
+  }
+  if (incomingCallUUID && incomingCallUUID !== callUUID) {
+    incomingCallUUID = null;
+  }
+  if (activeCallUUID && activeCallUUID !== callUUID) {
+    activeCallUUID = callUUID;
+  }
+}
+
+/**
+ * RNCallKeep keeps CallKit / ConnectionService actions that happened before JS
+ * registered its listeners (app closed or JS not started). Earlier this queue was
+ * read on Android only, so on iOS an answer from the closed app was lost.
+ */
+function recoverCallKeepInitialEvents(source: string): void {
+  const callKeepAny = RNCallKeep as any;
+  if (typeof callKeepAny?.getInitialEvents !== 'function') {
+    return;
+  }
+  Promise.resolve(callKeepAny.getInitialEvents())
+    .then((events: any[]) => {
+      const {answerUUID, endedUUIDs, audioActivated} = summarizeInitialCallKeepEvents(events);
+      if (typeof callKeepAny.clearInitialEvents === 'function') {
+        callKeepAny.clearInitialEvents();
       }
-    }, 200);
+      if (audioActivated) {
+        notifyWebRtcAudioSession(true, `initial_events_${source}`);
+      }
+      endedUUIDs.forEach(endedUUID => {
+        if (pendingAnswerCallUUID === endedUUID) {
+          pendingAnswerCallUUID = null;
+        }
+        rejectCall(endedUUID);
+      });
+      if (answerUUID) {
+        console.log('📞 Recovered answer from CallKeep initial events', {
+          answerUUID,
+          source,
+          platform: Platform.OS,
+        });
+        pendingAnswerCallUUID = answerUUID;
+        lastAcceptedCallUUID = answerUUID;
+        lastAcceptedAtMs = Date.now();
+        stopIncomingRingtone();
+        schedulePendingAnswer(answerUUID, 400, `initial_events_${source}`);
+      }
+    })
+    .catch(e => {
+      console.warn('Failed to process CallKeep initial events', e);
+    });
+}
+
+/**
+ * iOS + CallKit: the audio session is activated by CallKit, not by the app.
+ * WebRTC has to be told about it, otherwise a call answered from the lock screen
+ * or from the background has no sound (the app cannot activate audio itself there).
+ */
+function notifyWebRtcAudioSession(active: boolean, source: string): void {
+  if (Platform.OS !== 'ios') {
+    return;
+  }
+  try {
+    const session: any = RTCAudioSession;
+    if (active && typeof session?.audioSessionDidActivate === 'function') {
+      session.audioSessionDidActivate();
+    } else if (!active && typeof session?.audioSessionDidDeactivate === 'function') {
+      session.audioSessionDidDeactivate();
+    }
+    console.log(`iOS audio session ${active ? 'activated' : 'deactivated'} by CallKit (${source})`);
+  } catch (e) {
+    console.warn('Failed to notify WebRTC about CallKit audio session', e);
+  }
+}
+
+/**
+ * App became active (opened after answering from the lock screen / background):
+ * reconnect signaling and finish an answered call that has no connection yet.
+ */
+function onVoipAppActive(): void {
+  if (!isVoipInitialized) {
+    return;
+  }
+  ensureSocketConnected();
+  recoverCallKeepInitialEvents('app_active');
+  const target = pendingAnswerCallUUID || activeCallUUID;
+  const decision = decideOnResume({
+    pendingAnswerUUID: pendingAnswerCallUUID,
+    activeCallUUID,
+    callState: currentCallState,
+    hasPeer: !!pc,
+    answerInFlight: target ? answerGate.isInFlight(target) : false,
+    answerDone: target ? answerGate.isDone(target) : false,
+  });
+  if (decision.action === 'answer' && decision.uuid) {
+    schedulePendingAnswer(decision.uuid, 300, 'app_active');
+    return;
+  }
+  // Connection dropped while the phone was locked: restart ICE on the live peer.
+  const peer: any = pc;
+  if (
+    peer &&
+    activeCallUUID &&
+    (peer.iceConnectionState === 'failed' || peer.iceConnectionState === 'disconnected')
+  ) {
+    safeRestartIce(peer, 'app_active');
   }
 }
 
@@ -2891,22 +3042,9 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
 
     // Handle any pending answer that was waiting for initialization
     if (pendingAnswerCallUUID) {
-      const callUUID = pendingAnswerCallUUID;
-      // IMPORTANT: Set state immediately even if VoIP just initialized
-      // This ensures modal shows active call screen
-      activeCallUUID = callUUID;
-      incomingCallUUID = null;
-      currentCallState = 'answered';
-      console.log('✅ Call state set to answered immediately for pending call:', callUUID);
-      // Process it after a short delay to ensure everything is ready
-      setTimeout(() => {
-        if (activeCallUUID === callUUID) {
-          processPendingAnswer(callUUID).catch((e) => {
-            console.error('❌ Failed to process pending answer:', e);
-          });
-        }
-      }, 1500);
+      schedulePendingAnswer(pendingAnswerCallUUID, 1500, 'init_again');
     }
+    recoverCallKeepInitialEvents('init_again');
     return;
   }
 
@@ -3012,75 +3150,28 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
           console.warn('Failed to read Android initial notification', e);
         });
 
-      const callKeepAny = RNCallKeep as any;
-      if (callKeepAny?.getInitialEvents) {
-        Promise.resolve(callKeepAny.getInitialEvents())
-          .then((events: any[]) => {
-            if (!Array.isArray(events)) {
-              return;
-            }
-            let recoveredAnswerUUID: string | null = null;
-            events.forEach(event => {
-              if (event?.name === 'RNCallKeepPerformAnswerCallAction') {
-                const eventCallUUID = event?.data?.callUUID || null;
-                if (eventCallUUID) {
-                  pendingAnswerCallUUID = eventCallUUID;
-                  recoveredAnswerUUID = eventCallUUID;
-                }
-              } else if (event?.name === 'RNCallKeepPerformEndCallAction') {
-                const endedCallUUID = event?.data?.callUUID;
-                if (endedCallUUID) {
-                  rejectCall(endedCallUUID);
-                }
-              }
-            });
-
-            // Android background/killed recovery:
-            // if answer happened before JS listener registration, recover it immediately.
-            if (recoveredAnswerUUID) {
-              const answerUUID = recoveredAnswerUUID;
-              activeCallUUID = answerUUID;
-              incomingCallUUID = null;
-              currentCallState = 'answered';
-              setTimeout(() => {
-                if (activeCallUUID === answerUUID) {
-                  processPendingAnswer(answerUUID).catch(e => {
-                    console.error(
-                      '❌ Failed to process recovered Android background answer',
-                      e,
-                    );
-                  });
-                }
-              }, 400);
-            }
-
-            if (callKeepAny.clearInitialEvents) {
-              callKeepAny.clearInitialEvents();
-            }
-          })
-          .catch(e => {
-            console.warn('Failed to process Android CallKeep initial events', e);
-          });
-      }
+      // CallKeep initial events (answer before JS start) are recovered below for both platforms.
     }
+
+    // iOS and Android: answer made in CallKit / ConnectionService before JS started.
+    recoverCallKeepInitialEvents('init');
 
     // Handle any pending answer that was waiting for initialization
     if (pendingAnswerCallUUID) {
-      const callUUID = pendingAnswerCallUUID;
-      // IMPORTANT: Set state immediately even if VoIP just initialized
-      // This ensures modal shows active call screen
-      activeCallUUID = callUUID;
-      incomingCallUUID = null;
-      currentCallState = 'answered';
-      console.log('✅ Call state set to answered immediately for pending call:', callUUID);
-      // Process it after a short delay to ensure everything is ready
-      setTimeout(() => {
-        if (activeCallUUID === callUUID) {
-          processPendingAnswer(callUUID).catch((e) => {
-            console.error('❌ Failed to process pending answer on init:', e);
-          });
-        }
-      }, 1000);
+      schedulePendingAnswer(pendingAnswerCallUUID, 1000, 'init');
+    }
+
+    // Opening the app after answering from the lock screen / long background:
+    // reconnect signaling and complete the answer (both platforms).
+    if (!voipResumeSubscription) {
+      voipResumeSubscription = AppState.addEventListener(
+        'change',
+        (state: AppStateStatus) => {
+          if (state === 'active') {
+            onVoipAppActive();
+          }
+        },
+      );
     }
   } catch (e) {
     console.error('❌ Failed to setup CallKeep', e);
@@ -3202,24 +3293,11 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
 
     // After device is registered, process any pending answer
     // Wait a bit more to ensure socket is connected and registered
-    setTimeout(() => {
-      if (pendingAnswerCallUUID) {
-        const callUUID = pendingAnswerCallUUID;
-        // IMPORTANT: Set state immediately if not already set
-        // This ensures modal shows active call screen
-        if (currentCallState !== 'answered' || activeCallUUID !== callUUID) {
-          activeCallUUID = callUUID;
-          incomingCallUUID = null;
-          currentCallState = 'answered';
-          console.log('✅ Call state set to answered immediately for pending call:', callUUID);
-        }
-        // Don't clear pendingAnswerCallUUID here - let processPendingAnswer handle it
-        // Process it after device registration
-        processPendingAnswer(callUUID).catch((e) => {
-          console.error('❌ Failed to process pending answer after registration:', e);
-        });
-      }
-    }, 1500);
+    // Idempotent: the token event fires several times (requestToken retries),
+    // schedulePendingAnswer ignores a call that is already being answered.
+    if (pendingAnswerCallUUID) {
+      schedulePendingAnswer(pendingAnswerCallUUID, 1500, 'voip_register');
+    }
   });
 
   console.log('✅ VoIP token registration event listener set up successfully');
@@ -3333,6 +3411,20 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
 
     // Store the incoming call UUID so we can track it when user answers
     const callUUID = notification.callId || notification.uuid || String(Date.now());
+    if (notification.offer?.sdp) {
+      incomingOfferByCallId.set(callUUID, notification.offer);
+    }
+    // After a background resume the push event can arrive AFTER the answer event:
+    // do not turn an answered call back into "ringing".
+    if (
+      pendingAnswerCallUUID === callUUID ||
+      answerGate.isInFlight(callUUID) ||
+      answerGate.isDone(callUUID) ||
+      (activeCallUUID === callUUID && currentCallState !== 'ringing')
+    ) {
+      console.log('VoIP push for a call that is already answered, ignore UI reset:', callUUID);
+      return;
+    }
     incomingCallUUID = callUUID; // Track incoming call for modal
     // Don't set activeCallUUID yet - only set it when user actually answers
 
@@ -3441,6 +3533,9 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
     if (incomingCallUUID === callUUID) {
       incomingCallUUID = null;
     }
+    if (pendingAnswerCallUUID === callUUID) {
+      pendingAnswerCallUUID = null;
+    }
     incomingOfferByCallId.delete(callUUID);
     activeCallStartedAt = null;
     callerName = null;
@@ -3531,10 +3626,15 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
   });
 
   RNCallKeep.addEventListener('didActivateAudioSession', () => {
-    if (Platform.OS !== 'android') {
+    if (Platform.OS === 'ios') {
+      notifyWebRtcAudioSession(true, 'callkit');
       return;
     }
     activateAndroidAudioSession('didActivateAudioSession');
+  });
+
+  RNCallKeep.addEventListener('didDeactivateAudioSession', () => {
+    notifyWebRtcAudioSession(false, 'callkit');
   });
 
   RNCallKeep.addEventListener('didDisplayIncomingCall', ({callUUID, error}) => {
@@ -4504,6 +4604,21 @@ export function setMute(muted: boolean): void {
 // Process pending answer when app opens after answering from CallKeep
 // Shared function to handle answering a call (used by both CallKeep event and programmatic calls)
 async function handleAnswerCall(callUUID: string): Promise<void> {
+  if (!answerGate.begin(callUUID)) {
+    console.log('📞 Answer already running or done for call, skip duplicate:', callUUID);
+    return;
+  }
+  clearStaleCallStateFor(callUUID);
+  try {
+    await handleAnswerCallOnce(callUUID);
+    answerGate.finish(callUUID, true);
+  } catch (e) {
+    answerGate.finish(callUUID, false);
+    throw e;
+  }
+}
+
+async function handleAnswerCallOnce(callUUID: string): Promise<void> {
   if (!tryAcquireCallLock(callUUID, 'handleAnswerCall')) {
     throw new Error('Another call transition is already in progress');
   }
@@ -4728,6 +4843,38 @@ async function handleAnswerCall(callUUID: string): Promise<void> {
 }
 
 async function processPendingAnswer(callUUID: string): Promise<void> {
+  if (!answerGate.begin(callUUID)) {
+    console.log('processPendingAnswer: already running or done, skip duplicate:', callUUID);
+    return;
+  }
+  if (pendingAnswerCallUUID === callUUID) {
+    pendingAnswerCallUUID = null;
+  }
+  clearStaleCallStateFor(callUUID);
+  try {
+    await processPendingAnswerOnce(callUUID);
+    answerGate.finish(callUUID, true);
+  } catch (e) {
+    answerGate.finish(callUUID, false);
+    // Do not leave a frozen "answered" screen: end the call the same way handleAnswerCall does.
+    try {
+      RNCallKeep.endCall(callUUID);
+    } catch (endError) {
+      console.warn('⚠️ Failed to end CallKeep call:', endError);
+    }
+    if (activeCallUUID === callUUID) {
+      activeCallUUID = null;
+    }
+    endVoiceCall();
+    stopRingback();
+    stopIncomingRingtone();
+    activeCallStartedAt = null;
+    currentCallState = 'ended';
+    throw e;
+  }
+}
+
+async function processPendingAnswerOnce(callUUID: string): Promise<void> {
   if (!tryAcquireCallLock(callUUID, 'processPendingAnswer')) {
     throw new Error('Another call transition is already in progress');
   }
@@ -4741,6 +4888,17 @@ async function processPendingAnswer(callUUID: string): Promise<void> {
   incomingCallUUID = null;
   currentCallState = 'answered';
   console.log('processPendingAnswer: ✅ Call state set to answered immediately for callUUID:', callUUID);
+
+  // Cold start: answer and ICE candidates are sent with currentDeviceId, which on iOS
+  // appears only after the VoIP token event. Wait for it (up to ~6 s), then continue.
+  let deviceWait = 0;
+  while (!currentDeviceId && deviceWait < 30) {
+    await new Promise(resolve => setTimeout(resolve, 200));
+    deviceWait++;
+  }
+  if (!currentDeviceId) {
+    console.warn('processPendingAnswer: device token not ready, continuing without it');
+  }
 
   // Ensure socket is connected
   ensureSocketConnected();
