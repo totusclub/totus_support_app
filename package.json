@@ -11,7 +11,7 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "jest",
-    "check": "node scripts/check-voip-answer-recovery.mjs",
+    "check": "node scripts/check-voip-answer-recovery.mjs && node scripts/check-mic-permission.mjs",
     "bootstrap:android-wrapper": "sh scripts/bootstrap-android-wrapper.sh",
     "postinstall": "sh scripts/bootstrap-android-wrapper.sh --quiet || true"
   },
