@@ -265,7 +265,20 @@ M.RTCPeerConnection = function () {
     async setRemoteDescription(d) { p.remoteDescription = d; p.signalingState = 'have-remote-offer'; },
     async createAnswer() { return {type: 'answer', sdp: 'v=0 answer'}; },
     async createOffer() { return {type: 'offer', sdp: 'v=0 offer'}; },
-    async setLocalDescription(d) { p.localDescription = d; p.signalingState = 'stable'; },
+    async setLocalDescription(d) {
+      p.localDescription = d;
+      p.signalingState = 'stable';
+      // Media connects shortly after the answer (VoipService ends a call whose media never connects).
+      if (d && d.type === 'answer') {
+        setTimeout(() => {
+          if (p.connectionState === 'closed') return;
+          p.iceConnectionState = 'connected';
+          p.connectionState = 'connected';
+          if (p.oniceconnectionstatechange) p.oniceconnectionstatechange();
+          if (p.onconnectionstatechange) p.onconnectionstatechange();
+        }, 300);
+      }
+    },
     async addIceCandidate() {}, restartIce() {}, close() { p.connectionState = 'closed'; p.signalingState = 'closed'; },
   };
   M.peers.push(p);

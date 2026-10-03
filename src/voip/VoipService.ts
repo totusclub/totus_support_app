@@ -888,6 +888,71 @@ export async function handleAndroidIncomingCallNotification(
   registerAndroidAudioRouteObservers();
 }
 
+/** Устройство уже в другом живом звонке (есть peer или идёт переход ответа / исходящего). */
+function isBusyWithOtherCall(callId: string): boolean {
+  const current = activeCallUUID;
+  if (!current || current === callId) {
+    return false;
+  }
+  return Boolean(pc) || (isCallTransitionLocked && activeCallLockUUID !== callId);
+}
+
+/** Остатки прошлого звонка без peer не должны заслонять новый входящий (getCallState берёт activeCallUUID первым). */
+function dropStaleCallLeftovers(callId: string): void {
+  if (activeCallUUID && activeCallUUID !== callId && !pc) {
+    activeCallUUID = null;
+    activeCallStartedAt = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Сторож соединения: ответ принят / применён, но медиа так и не соединилось за
+// MEDIA_CONNECT_TIMEOUT_MS — завершаем звонок как обычный отбой пользователя, чтобы сервер и
+// другие устройства не считали «пустой» звонок активным.
+// ---------------------------------------------------------------------------
+const MEDIA_CONNECT_TIMEOUT_MS = 20000;
+let mediaWatchdog: ReturnType<typeof setTimeout> | null = null;
+let mediaWatchdogCallId: string | null = null;
+
+function isPeerMediaConnected(peer: any): boolean {
+  if (!peer) {
+    return false;
+  }
+  return (
+    peer.iceConnectionState === 'connected' ||
+    peer.iceConnectionState === 'completed' ||
+    peer.connectionState === 'connected'
+  );
+}
+
+function clearMediaWatchdog(): void {
+  if (mediaWatchdog) {
+    clearTimeout(mediaWatchdog);
+  }
+  mediaWatchdog = null;
+  mediaWatchdogCallId = null;
+}
+
+function startMediaWatchdog(callId: string, side: 'caller' | 'callee'): void {
+  if (!callId || mediaWatchdogCallId === callId || isPeerMediaConnected(pc)) {
+    return;
+  }
+  clearMediaWatchdog();
+  mediaWatchdogCallId = callId;
+  mediaWatchdog = setTimeout(() => {
+    mediaWatchdog = null;
+    if (mediaWatchdogCallId !== callId) {
+      return;
+    }
+    mediaWatchdogCallId = null;
+    if ((activeCallUUID || incomingCallUUID) !== callId || isPeerMediaConnected(pc)) {
+      return;
+    }
+    console.warn(`Media watchdog (${side}): no connection ${MEDIA_CONNECT_TIMEOUT_MS} ms after the answer, ending call`, callId);
+    endCall();
+  }, MEDIA_CONNECT_TIMEOUT_MS);
+}
+
 function ensureSocketConnected() {
   if (isIncomingUiWindowActive()) {
     androidTelemetry('socket_connect_frozen_incoming_ui');
@@ -977,6 +1042,29 @@ function ensureSocketConnected() {
   socket.on('call-state', payload => {
     console.log('Socket call-state:', payload);
     const callId = payload?.callId;
+    // Состояние ЧУЖОГО звонка (повтор 'ended' старого звонка, поздний /end прошлого звонка) или
+    // звонка, о котором движок не знает, не должно трогать текущий звонок: для ended/rejected
+    // только убираем запись CallKit этого звонка, 'answered' игнорируем. 'ringing' нового входящего
+    // проходит, если устройство не занято живым звонком (остатки прошлого звонка не мешают).
+    const currentCallId = activeCallUUID || incomingCallUUID || pendingAnswerCallUUID;
+    if (callId && callId !== currentCallId) {
+      if (payload?.state === 'ringing') {
+        if (isBusyWithOtherCall(callId)) {
+          console.log('Socket ringing for another call ignored (busy):', callId, 'current:', currentCallId);
+          return;
+        }
+        dropStaleCallLeftovers(callId);
+        incomingCallUUID = callId;
+      } else {
+        if (payload?.state === 'ended' || payload?.state === 'rejected') {
+          try {
+            RNCallKeep.endCall(callId);
+          } catch (e) {}
+        }
+        console.log('Socket call-state for another/unknown call ignored:', callId, payload?.state, 'current:', currentCallId);
+        return;
+      }
+    }
 
     // Handle rejected state (caller receives rejection notification)
     if (payload?.state === 'rejected' && callId) {
@@ -1007,16 +1095,11 @@ function ensureSocketConnected() {
     // When backend reports that the call was answered (for the caller),
     // start the JS-side call timer and mark call as active in CallKeep.
     if (payload?.state === 'answered' && callId) {
-      console.log('Call answered - starting timer for call', callId);
+      console.log('Call answered for call', callId);
       currentCallState = 'answered';
-      connectionState = 'connected';
+      // connectionState and the call timer follow the real peer connection events
+      // (onconnectionstatechange / oniceconnectionstatechange), not signaling.
       pushNativeConnectionStatus();
-
-      // Only start timer if not already started (avoid restarting)
-      if (!activeCallStartedAt && activeCallUUID === callId) {
-        activeCallStartedAt = Date.now();
-        console.log('Started call timer at', activeCallStartedAt);
-      }
 
       // Mark call as active in CallKeep so the native timer starts and UI updates
       // This is especially important for the caller to see the call as connected
@@ -1095,7 +1178,8 @@ function ensureSocketConnected() {
       return;
     }
     // Guard: ignore offer if it's for a different user (account switch race)
-    if (toLoyaltyId && currentLoyaltyId && toLoyaltyId !== currentLoyaltyId) {
+    // DB stores "1111 2222 3333 4444", the app may hold "1111222233334444"
+    if (toLoyaltyId && currentLoyaltyId && String(toLoyaltyId).replace(/\s+/g, '') !== String(currentLoyaltyId).replace(/\s+/g, '')) {
       console.log('⚠️ Ignoring socket offer for different user:', toLoyaltyId, 'current:', currentLoyaltyId);
       return;
     }
@@ -1106,7 +1190,12 @@ function ensureSocketConnected() {
     // For incoming calls, only cache offer and set ringing state.
     // Do NOT create RTCPeerConnection here; create it only after user answers.
     incomingOfferByCallId.set(callId, offer);
+    if (isBusyWithOtherCall(callId)) {
+      console.log('Socket offer cached, device is busy with another call:', callId);
+      return;
+    }
     if (!activeCallUUID || activeCallUUID !== callId) {
+      dropStaleCallLeftovers(callId);
       incomingCallUUID = callId;
       currentCallState = 'ringing';
       connectionState = 'connecting';
@@ -1137,6 +1226,7 @@ function ensureSocketConnected() {
           try {
             await pc.setRemoteDescription(new RTCSessionDescription(answer));
             answerProcessedForCall = callId; // Mark as processed immediately
+            startMediaWatchdog(callId, 'caller');
             console.log('✅ Socket: remote description set from socket answer');
 
             // CRITICAL: Process any queued ICE candidates now that remote description is set
@@ -1312,6 +1402,7 @@ async function fetchRemoteOfferWithRetry(
   maxAttempts = OFFER_FETCH_MAX_ATTEMPTS,
 ): Promise<{type: string; sdp: string}> {
   let lastStatus: number | null = null;
+  let finishedState: string | null = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const pauseMs = offerRetryDelayMs(attempt);
     if (pauseMs > 0) {
@@ -1323,6 +1414,11 @@ async function fetchRemoteOfferWithRetry(
       lastStatus = resp.status;
       if (resp.ok) {
         const data = await resp.json();
+        if (data?.state === 'ended' || data?.state === 'rejected' || data?.state === 'missed') {
+          // do not build a connection for a call the server already finished
+          finishedState = data.state;
+          break;
+        }
         if (data?.offer?.sdp) {
           return data.offer;
         }
@@ -1332,6 +1428,9 @@ async function fetchRemoteOfferWithRetry(
     }
   }
 
+  if (finishedState) {
+    throw new Error(`Call ${callUUID} is already ${finishedState}`);
+  }
   throw new Error(
     `No remote offer found for call ${callUUID} after ${maxAttempts} attempts (last status: ${lastStatus ?? 'n/a'})`,
   );
@@ -1726,6 +1825,7 @@ async function startVoiceCall(
   }
   // Reset ICE restart attempts for new call
   iceRestartAttempts = 0;
+  clearMediaWatchdog();
   if (iceFailureTimeout) {
     clearTimeout(iceFailureTimeout);
     iceFailureTimeout = null;
@@ -1771,6 +1871,12 @@ async function startVoiceCall(
       connectionState = 'connecting';
     } else if (state === 'connected') {
       connectionState = 'connected';
+      if (mediaWatchdogCallId === callUUID) {
+        clearMediaWatchdog();
+      }
+      if (!activeCallStartedAt && activeCallUUID === callUUID && currentCallState === 'answered') {
+        activeCallStartedAt = Date.now();
+      }
       // console.log('✅ Peer connection established successfully!');
       // Update call state to answered when connection is established
       if (currentCallState === 'calling' || currentCallState === 'ringing') {
@@ -1834,6 +1940,9 @@ async function startVoiceCall(
       }
     } else if (iceState === 'connected' || iceState === 'completed') {
       connectionState = 'connected';
+      if (mediaWatchdogCallId === callUUID) {
+        clearMediaWatchdog();
+      }
       console.log('✅ ICE connection established!');
       // Reset restart attempts on successful connection
       iceRestartAttempts = 0;
@@ -2182,6 +2291,7 @@ async function waitForAnswer(callId: string): Promise<void> {
           try {
             await currentPc.setRemoteDescription(new RTCSessionDescription(receivedAnswer));
             answerProcessedForCall = callId; // Mark as processed immediately
+            startMediaWatchdog(callId, 'caller');
             console.log('waitForAnswer: remote description set successfully via socket');
 
             // Start timer when caller receives answer (if not already started)
@@ -2275,6 +2385,7 @@ async function waitForAnswerHTTP(callId: string): Promise<void> {
             try {
               await currentPc.setRemoteDescription(new RTCSessionDescription(data.answer));
               answerProcessedForCall = callId; // Mark as processed immediately
+              startMediaWatchdog(callId, 'caller');
               console.log('✅ waitForAnswerHTTP: remote description set successfully');
 
               // CRITICAL: Process any queued ICE candidates now that remote description is set
@@ -2428,13 +2539,22 @@ async function sendAnswerToBackend(callId: string) {
 
       if (!resp.ok) {
         const errorText = await resp.text();
+        // 404/409/410 = call unknown / answered elsewhere / already finished -> final
+        if (resp.status >= 400 && resp.status < 500) {
+          const finalErr: any = new Error(`Backend rejected answer: ${resp.status} - ${errorText}`);
+          finalErr.final = true;
+          throw finalErr;
+        }
         throw new Error(`Backend rejected answer: ${resp.status} - ${errorText}`);
       }
 
       console.log('✅ sendAnswerToBackend: Answer sent to backend via HTTP successfully');
       return;
-    } catch (e) {
+    } catch (e: any) {
       lastError = e;
+      if (e && e.final) {
+        throw e;
+      }
       console.warn(`⚠️ sendAnswerToBackend: HTTP attempt ${attempt} failed`, e);
       if (attempt < 8) {
         await new Promise(resolve => setTimeout(resolve, 500));
@@ -2746,6 +2866,7 @@ export async function startOutgoingVoiceCall(
 
 function endVoiceCall() {
   console.log('endVoiceCall: Stopping all media tracks and cleaning up...');
+  clearMediaWatchdog();
 
   // Clear ICE failure timeout if active
   if (iceFailureTimeout) {
@@ -3379,7 +3500,7 @@ export function initVoipAndCallKeep(loyaltyId?: string) {
     // Backend includes toLoyaltyId (callee) in payload. If we're logged in as different user, ignore.
     const toLoyaltyId = notification.toLoyaltyId || notification.toUserId;
     const callIdForDismiss = notification.callId || notification.uuid;
-    if (toLoyaltyId && currentLoyaltyId && toLoyaltyId !== currentLoyaltyId) {
+    if (toLoyaltyId && currentLoyaltyId && String(toLoyaltyId).replace(/\s+/g, '') !== String(currentLoyaltyId).replace(/\s+/g, '')) {
       console.log('⚠️ Ignoring VoIP push for different user:', toLoyaltyId, 'current:', currentLoyaltyId);
       if (callIdForDismiss) {
         try {
@@ -4724,11 +4845,12 @@ async function handleAnswerCallOnce(callUUID: string): Promise<void> {
 
       try {
         await sendAnswerToBackend(callUUID);
+        startMediaWatchdog(callUUID, 'callee');
         console.log('✅ Answer sent to backend for call:', callUUID);
       } catch (e) {
         console.error('❌ Failed to send answer to backend:', e);
-        // Don't throw - we still want the call to continue
-        // The answer might be sent via HTTP polling fallback
+        // without an accepted answer there is no call — end it (catch below ends CallKit)
+        throw e;
       }
 
       // Backend will automatically notify caller via socket when answer is received
@@ -4791,6 +4913,7 @@ async function handleAnswerCallOnce(callUUID: string): Promise<void> {
 
               // Now send the answer
               await sendAnswerToBackend(callUUID);
+              startMediaWatchdog(callUUID, 'callee');
               console.log('✅ Answer sent to backend for existing peer connection');
             } catch (createError) {
               console.error('❌ Failed to create answer for existing peer connection:', createError);
@@ -4801,6 +4924,7 @@ async function handleAnswerCallOnce(callUUID: string): Promise<void> {
           console.log('✅ Answer already exists for peer connection, sending to backend...');
           try {
             await sendAnswerToBackend(callUUID);
+            startMediaWatchdog(callUUID, 'callee');
             console.log('✅ Answer sent to backend for existing peer connection');
           } catch (sendError) {
             console.error('❌ Failed to send existing answer to backend:', sendError);
@@ -4951,6 +5075,7 @@ async function processPendingAnswerOnce(callUUID: string): Promise<void> {
     // Send our answer SDP back to backend
     console.log('processPendingAnswer: Sending answer to backend...');
     await sendAnswerToBackend(callUUID);
+    startMediaWatchdog(callUUID, 'callee');
     console.log('processPendingAnswer: Answer sent to backend');
 
     // Poll for remote ICE candidates
