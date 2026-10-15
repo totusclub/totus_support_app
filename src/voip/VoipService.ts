@@ -4962,6 +4962,14 @@ async function handleAnswerCallOnce(callUUID: string): Promise<void> {
     stopIncomingRingtone();
     activeCallStartedAt = null;
     currentCallState = 'ended';
+    // Ответ не удался (звонок уже завершён / 404 / 409 / 410): endVoiceCall() уже вернул 'idle',
+    // а здесь снова 'ended' — без возврата в 'idle' экран «Звонок завершён» не закрывался,
+    // а новый звонок блокировался («Сначала завершите текущий звонок»). Как в других ветках завершения.
+    setTimeout(() => {
+      if (currentCallState === 'ended' && !activeCallUUID && !incomingCallUUID) {
+        currentCallState = 'idle';
+      }
+    }, 3000);
     throw e;
   }
 }
@@ -4994,6 +5002,14 @@ async function processPendingAnswer(callUUID: string): Promise<void> {
     stopIncomingRingtone();
     activeCallStartedAt = null;
     currentCallState = 'ended';
+    // Ответ не удался (звонок уже завершён / 404 / 409 / 410): endVoiceCall() уже вернул 'idle',
+    // а здесь снова 'ended' — без возврата в 'idle' экран «Звонок завершён» не закрывался,
+    // а новый звонок блокировался («Сначала завершите текущий звонок»). Как в других ветках завершения.
+    setTimeout(() => {
+      if (currentCallState === 'ended' && !activeCallUUID && !incomingCallUUID) {
+        currentCallState = 'idle';
+      }
+    }, 3000);
     throw e;
   }
 }
