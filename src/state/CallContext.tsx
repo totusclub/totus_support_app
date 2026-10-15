@@ -101,6 +101,9 @@ export function CallProvider({children}: {children: React.ReactNode}) {
   const [screenVisible, setScreenVisible] = useState(false);
 
   const tracked = useRef<TrackedCall | null>(null);
+  // Собеседник только что завершённого звонка: VoipService при завершении сразу обнуляет
+  // callerName, а tracked очищается — без этого экран «Звонок завершён» показывал «Неизвестный».
+  const lastPeer = useRef<{callId: string; name: string; loyaltyId: string | null} | null>(null);
   const pendingOutgoing = useRef<CallTarget | null>(null);
   const prevState = useRef<UiCallState>('idle');
   const snapRef = useRef<CallSnapshot>(EMPTY);
@@ -109,6 +112,7 @@ export function CallProvider({children}: {children: React.ReactNode}) {
     const t = tracked.current;
     if (!t) return;
     tracked.current = null;
+    lastPeer.current = {callId: t.callId, name: t.peerName, loyaltyId: t.peerLoyaltyId};
     const endedAt = Date.now();
     let outcome: 'answered' | 'missed' | 'rejected' | 'no_answer';
     if (t.answered) outcome = 'answered';
@@ -136,6 +140,7 @@ export function CallProvider({children}: {children: React.ReactNode}) {
         const outgoing = state === 'calling' || (state === 'answered' && !!pendingOutgoing.current);
         const target = outgoing ? pendingOutgoing.current : null;
         pendingOutgoing.current = null;
+        lastPeer.current = null;
         const t: TrackedCall = {
           callId: s.callUUID,
           direction: outgoing ? 'outgoing' : 'incoming',
@@ -166,6 +171,10 @@ export function CallProvider({children}: {children: React.ReactNode}) {
             const peer = ci.fromLoyaltyId || null;
             t.peerLoyaltyId = peer;
             if (ci.callerName) t.peerName = ci.callerName;
+            // ответ сервера пришёл, когда звонок уже завершился — обновить и экран «Звонок завершён»
+            if (lastPeer.current?.callId === t.callId) {
+              lastPeer.current = {callId: t.callId, name: t.peerName, loyaltyId: peer};
+            }
             upsertCallRecord({callId: t.callId, peerLoyaltyId: peer, peerName: t.peerName}).catch(() => {});
           });
         }
@@ -201,20 +210,28 @@ export function CallProvider({children}: {children: React.ReactNode}) {
     if (prev !== state && state === 'idle') {
       // карточку закрываем чуть позже, чтобы было видно «Звонок завершён»
       setTimeout(() => {
-        if (prevState.current === 'idle') setScreenVisible(false);
+        if (prevState.current === 'idle') {
+          setScreenVisible(false);
+          lastPeer.current = null;
+        }
       }, 1500);
     }
+
+    // После завершения (нет текущего звонка) — имя и ID собеседника завершённого звонка
+    const ended = !tracked.current && !s.callUUID ? lastPeer.current : null;
 
     const next: CallSnapshot = {
       state,
       callUUID: s.callUUID,
-      callerName: s.callerName || tracked.current?.peerName || null,
+      callerName:
+        s.callerName || tracked.current?.peerName || pendingOutgoing.current?.name || ended?.name || null,
       isMuted: s.isMuted,
       speakerOn: s.speakerMode === 'loudspeaker' || s.isSpeakerEnabled,
       connectionState: s.connectionState,
       startedAt: info.isActive ? info.startedAt : null,
       direction: tracked.current?.direction || null,
-      peerLoyaltyId: tracked.current?.peerLoyaltyId || null,
+      peerLoyaltyId:
+        tracked.current?.peerLoyaltyId || pendingOutgoing.current?.loyaltyId || ended?.loyaltyId || null,
     };
     snapRef.current = next;
     setSnap(prevSnap =>
@@ -258,6 +275,7 @@ export function CallProvider({children}: {children: React.ReactNode}) {
       }
       // loyaltyId передаём в том виде, в каком его отдал backend (сравнение — по нормализованному)
       pendingOutgoing.current = {loyaltyId: target.loyaltyId, name: target.name};
+      lastPeer.current = null;
       setScreenVisible(true);
       try {
         // Промис живёт до ответа/сброса — не блокируем UI
