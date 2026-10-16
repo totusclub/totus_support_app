@@ -91,7 +91,15 @@ export default function CallOverlay() {
           <Icon name="phone" size={16} color="#fff" />
           <Text style={styles.miniText} numberOfLines={1}>
             {c.callerName || 'Звонок'}
-            {isAnswered && c.startedAt ? ` · ${formatDuration(c.seconds)}` : isRinging ? ' · входящий' : ' · вызов…'}
+            {isAnswered && c.startedAt
+              ? ` · ${formatDuration(c.seconds)}`
+              : isAnswered
+              ? ' · разговор'
+              : isRinging
+              ? ' · входящий'
+              : isCalling
+              ? ' · вызов…'
+              : ' · завершён'}
           </Text>
           <Text style={styles.miniText}>Открыть</Text>
         </Pressable>
@@ -115,9 +123,9 @@ export default function CallOverlay() {
               {label.toUpperCase()}
             </Text>
             <Text style={[styles.name, {color: p.textPrimary}]} numberOfLines={2}>
-              {c.callerName || 'Неизвестный'}
+              {c.callerName || (c.peerLoyaltyId ? `ID ${formatLoyaltyId(c.peerLoyaltyId)}` : 'Пользователь')}
             </Text>
-            {c.peerLoyaltyId ? (
+            {c.peerLoyaltyId && c.callerName ? (
               <Text style={[font.caption, {color: p.textTertiary}]}>ID {formatLoyaltyId(c.peerLoyaltyId)}</Text>
             ) : null}
             <View style={[styles.stateBadge, {backgroundColor: badge.bg}]}>
