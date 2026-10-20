@@ -15,6 +15,9 @@ NS_ASSUME_NONNULL_BEGIN
 + (void)didUpdatePushCredentials:(PKPushCredentials *)credentials forType:(PKPushType)type;
 + (void)didReceiveIncomingPushWithPayload:(PKPushPayload *)payload forType:(PKPushType)type completion:(void (^)(void))completion;
 + (void)addCompletionHandler:(NSString *)uuid completionHandler:(void (^)(void))completionHandler;
+/// APNs-токен обычных (alert) пушей — из AppDelegate didRegisterForRemoteNotificationsWithDeviceToken.
+/// JS читает его через NativeModules.TotusApns.getToken() (src/push/remotePush.ts).
++ (void)setApnsDeviceToken:(NSData *)deviceToken;
 
 @end
 

@@ -43,6 +43,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
     registry.desiredPushTypes = [.voIP]
     voipRegistry = registry
 
+    // Обычные (alert) пуши — сообщения пользователей, когда приложение свёрнуто или экран
+    // заблокирован (calling_api_v2 lib/staffPush.js). Токен уходит в JS через
+    // NativeModules.TotusApns → POST /api/support/push-device.
+    application.registerForRemoteNotifications()
+
     let delegate = ReactNativeDelegate()
     let factory = RCTReactNativeFactory(delegate: delegate)
     delegate.dependencyProvider = RCTAppDependencyProvider()
@@ -108,12 +113,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, PKPushRegistryDelegate {
     return RCTLinkingManager.application(app, open: url, options: options)
   }
 
-  // MARK: - APNs (FCM)
+  // MARK: - APNs (сообщения пользователей; FCM — если подключён Firebase)
 
   func application(
     _ application: UIApplication,
     didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
   ) {
+    VoipPushHelper.setApnsDeviceToken(deviceToken)
     if FirebaseApp.app() != nil {
       Messaging.messaging().setAPNSToken(deviceToken, type: .unknown)
     }
