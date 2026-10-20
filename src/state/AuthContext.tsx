@@ -13,7 +13,8 @@ import {ensureFreshAccessToken, loadTokens, setSessionExpiredHandler} from '../a
 import {initCallKeep} from '../voip/CallService';
 import {cleanupVoipOnLogout} from '../voip/VoipService';
 import {cancelMicPermissionRequest, ensureMicPermissionWhenActive} from '../voip/micPermission';
-import {connectSupportSocket, disconnectSupportSocket} from '../realtime/supportSocket';
+import {connectSupportSocket, disconnectSupportSocket, updateSupportPresence} from '../realtime/supportSocket';
+import {registerRemotePush, unregisterRemotePush} from '../push/remotePush';
 import {setHistoryOwner} from '../history/callHistory';
 import {
   ensureNotificationChannels,
@@ -56,7 +57,13 @@ async function startServices(user: AgentUser) {
   }
   connectSupportSocket();
   ensureNotificationChannels().catch(() => {});
-  requestNotificationPermission().catch(() => {});
+  // Разрешение на уведомления, затем APNs-токен на сервер — пуши о сообщениях пользователей,
+  // когда приложение свёрнуто или экран заблокирован (src/push/remotePush.ts)
+  requestNotificationPermission()
+    .catch(() => false)
+    .then(() => registerRemotePush())
+    .then(() => updateSupportPresence())
+    .catch(() => {});
   // iOS: доступ к микрофону заранее, пока приложение на экране — иначе первый ответ
   // на звонок из CallKit / с экрана блокировки сбрасывается (нельзя показать запрос)
   ensureMicPermissionWhenActive();
@@ -80,6 +87,8 @@ export function AuthProvider({children}: {children: React.ReactNode}) {
     } catch (e) {
       console.warn('[auth] cleanupVoipOnLogout failed', e);
     }
+    // Пока токен сессии жив: снять пуши о сообщениях только с этого устройства
+    await unregisterRemotePush().catch(() => {});
     disconnectSupportSocket();
     await clearSession();
     setBadgeCount(0).catch(() => {});
@@ -130,6 +139,10 @@ export function AuthProvider({children}: {children: React.ReactNode}) {
           if (!userRef.current) return;
           if (refreshed) disconnectSupportSocket(); // новое соединение уйдёт с новым токеном
           connectSupportSocket();
+          // Токен APNs мог смениться (переустановка, восстановление из копии) — обновить на сервере
+          registerRemotePush()
+            .then(() => updateSupportPresence())
+            .catch(() => {});
         });
     });
     // Длинная смена: освежать токен заранее, пока приложение открыто

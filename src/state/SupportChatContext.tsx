@@ -6,6 +6,7 @@ import {AppState} from 'react-native';
 import {chatUserName, getSummary, type SupportSummary} from '../api/supportChat';
 import {isSupportSocketConnected, onSupportEvent} from '../realtime/supportSocket';
 import {setBadgeCount, showMessageNotification, cancelChatNotification} from '../push/localNotifications';
+import {isRemotePushActive} from '../push/remotePush';
 import {useAuth} from './AuthContext';
 
 const SUMMARY_POLL_MS = 30_000;
@@ -75,6 +76,8 @@ export function SupportChatProvider({children}: {children: React.ReactNode}) {
       const appActive = AppState.currentState === 'active';
       const viewing = appActive && activeChatRef.current === chat.id;
       if (viewing) return;
+      // Свёрнуто, а сервер шлёт пуши этому iPhone — второе (локальное) уведомление не нужно
+      if (!appActive && isRemotePushActive()) return;
       const now = Date.now();
       if (now - lastNotifyRef.current < NOTIFY_THROTTLE_MS && appActive) return;
       lastNotifyRef.current = now;
